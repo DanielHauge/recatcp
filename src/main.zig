@@ -47,9 +47,9 @@ pub fn main() anyerror!void {
     var ip: []const u8 = "127.0.0.1";
 
     if (res.args.help != 0)
-        debug.print("--help\n", .{});
+        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
     if (res.positionals.len == 0)
-        debug.print("no positionals\n", .{});
+        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
     if (res.args.seconds) |secs|
         timespan.seconds = secs;
     if (res.args.minutes) |mins|
