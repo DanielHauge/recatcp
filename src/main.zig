@@ -16,6 +16,8 @@ fn replace(self: []const u8, old: u8, new: u8) []const u8 {
     return buffer;
 }
 
+const usage_str = "\nUsage:\n\trecatcp [options] <files...>\n\nOptions:\n";
+
 pub fn main() anyerror!void {
     defer _ = gpa.deinit();
     const params = comptime clap.parseParamsComptime(
@@ -24,17 +26,17 @@ pub fn main() anyerror!void {
         \\-m, --minutes <i64>    Minutes added to timespan which file will be replayed over.
         \\-H, --hours <i64>      Hours added to timespan which file will be replayed over.
         \\-t, --time <str>       Time added to timespan which file will be replayed over in the format XXhXXmXXs.
-        \\-p, --port <u16>       The port to send the replayed file to.
-        \\-i, --ip <str>    The address to send the replayed file to.
-        \\-b, --buffersize <u64> The size of the buffer to send the file in.
-        \\ <str>...                The file to replay.
+        \\-p, --port <u16>       The port to send the replayed file to. Defaults to 6969.
+        \\-i, --ip <str>    The address to send the replayed file to. Defaults to 127.0.0.1
+        \\-b, --buffersize <u64> The size of the buffer to send the file in. Defaults to 32 KB (32768).
+        \\ <str>...                The files to replay.
     );
     var diag = clap.Diagnostic{};
     var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
         .diagnostic = &diag,
         .allocator = gpa.allocator(),
     }) catch |err| {
-        // Report useful error and exit
+        debug.print(usage_str, .{});
         diag.report(io.getStdErr().writer(), err) catch {};
         return err;
     };
@@ -42,7 +44,9 @@ pub fn main() anyerror!void {
 
     var timespan = TimeSpan{ .hours = 0, .minutes = 0, .seconds = 0 };
     var port: u16 = 6969;
-    var buffer_size: u64 = 4096;
+    // defaults to 208 KB
+    const KB: u64 = 1024;
+    var buffer_size: u64 = KB * 32;
     // declare string, set later
     var ip: []const u8 = "127.0.0.1";
 
@@ -65,16 +69,45 @@ pub fn main() anyerror!void {
     if (res.args.buffersize) |bs|
         buffer_size = bs;
     for (res.positionals) |pos| {
-        // open file
-        const file = try open_file_readonly(pos);
+        const file = open_file_readonly(pos) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    debug.print("File not found: {s}\n", .{pos});
+                },
+                error.PermissionDenied => {
+                    debug.print("Permission denied for file: {s}\n", .{pos});
+                },
+                else => {
+                    debug.print("Could not open file: {s}\n", .{pos});
+                },
+            }
+            debug.print(usage_str, .{});
+            return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        };
         defer file.close();
-        const addr = try std.net.Address.parseIp(ip, port);
+        const addr = std.net.Address.parseIp(ip, port) catch {
+            debug.print("Could not parse ip: {s} and port: {d}", .{ ip, port });
+
+            debug.print(usage_str, .{});
+            return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        };
         const real_path = try std.fs.realpathAlloc(allocator, pos);
         debug.print("Streaming file: {s} - over: {d} hours {d} minutes {d} seconds - to: {s}:{d}\n", .{ real_path, timespan.hours, timespan.minutes, timespan.seconds, ip, port });
-        try stream_file(file, timespan, addr, buffer_size);
-        debug.print("hours: {d}\n", .{timespan.hours});
-        debug.print("minutes: {d}\n", .{timespan.minutes});
-        debug.print("seconds: {d}\n", .{timespan.seconds});
+        stream_file(file, timespan, addr, buffer_size) catch |err| {
+            switch (err) {
+                error.ConnectionRefused => {
+                    debug.print("Connection refused to: {s}:{d}\n", .{ ip, port });
+                },
+                error.ConnectionReset => {
+                    debug.print("Connection reset to: {s}:{d}\n", .{ ip, port });
+                },
+                else => {
+                    debug.print("Error streaming file: {s} to {s}:{d}\n", .{ pos, ip, port });
+                },
+            }
+            debug.print(usage_str, .{});
+            return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        };
     }
 }
 
@@ -82,35 +115,46 @@ fn stream_file(file: std.fs.File, timespan: TimeSpan, addr: std.net.Address, buf
     const socket = try std.net.tcpConnectToAddress(addr);
     const file_stat = try file.stat();
     const file_size = file_stat.size;
+    const file_size_f: f64 = @floatFromInt(file_size);
     const total_seconds: u64 = @intCast(timespan.hours * 3600 + timespan.minutes * 60 + timespan.seconds);
-    var bytes_per_seconds: u64 = 1;
-    var ns_per_buffer: u64 = 0;
-    debug.print("total_seconds: {d}\n", .{total_seconds});
+    const total_ns: i128 = total_seconds * 1_000_000_000;
+    const total_ns_f: f64 = @floatFromInt(total_ns);
+    const buffer_size_f: f64 = @floatFromInt(buffer_size);
+    var ns_per_buffer: i128 = 0;
+    var total_read: u64 = 0;
     if (total_seconds == 0) {
         ns_per_buffer = 0;
     } else {
-        // uint64.max is the max value for u64
-        bytes_per_seconds = file_size / total_seconds;
-        const buffers_per_seconds = bytes_per_seconds / buffer_size;
-        ns_per_buffer = 1_000_000_000 / buffers_per_seconds;
+        const bytes_per_ns: f64 = file_size_f / total_ns_f;
+        const ns_per_buffer_f: f64 = buffer_size_f / bytes_per_ns;
+        ns_per_buffer = @intFromFloat(ns_per_buffer_f);
     }
-    const now: u64 = @intCast(std.time.nanoTimestamp());
-    debug.print("ms_per_buffer: {d}\n", .{ns_per_buffer});
+    const now = std.time.nanoTimestamp();
     var next_buffer = now + ns_per_buffer;
+    var next_report = now + 1_000_000_000;
 
     const buffer = try allocator.alloc(u8, buffer_size);
     defer allocator.free(buffer);
     while (true) {
         const read = try file.read(buffer);
         if (read == 0) {
+            debug.print("\t100% - {d}/{d}         \r\x1b[?25h\n", .{ file_size, file_size });
             break;
         }
+        total_read += read;
         // Send buffer to addr
         try socket.writeAll(buffer[0..read]);
-        const time_now: u64 = @intCast(std.time.nanoTimestamp());
-        if (next_buffer > time_now) {
-            const time_until_next_buffer = next_buffer - time_now;
-            std.time.sleep(time_until_next_buffer);
+        const time_now_ns = std.time.nanoTimestamp();
+        if (next_buffer > time_now_ns) {
+            const time_until_next_buffer = next_buffer - time_now_ns;
+            const sleep_dur: u64 = @intCast(time_until_next_buffer);
+            std.time.sleep(sleep_dur);
+        }
+        if (next_report < time_now_ns) {
+            // Floor the float
+            const percent = (total_read * 100) / file_size;
+            debug.print("\t{d}% - {d}/{d}         \r\x1b[?25l", .{ percent, total_read, file_size });
+            next_report = time_now_ns + 1_000_000_000;
         }
         next_buffer += ns_per_buffer;
     }
